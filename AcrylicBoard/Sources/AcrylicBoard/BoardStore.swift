@@ -51,6 +51,21 @@ struct BoardItem: Codable, Identifiable, Equatable {
     }
 }
 
+// MARK: - 用户设置 & 画布作用域
+
+/// 一块画布的内容归属：要么是“跟随全部桌面的全局画布”，要么是“某个桌面(Space)的独立画布”。
+enum BoardScope: Hashable {
+    case global
+    case space(SpaceManager.SpaceID)
+
+    var fileName: String {
+        switch self {
+        case .global: return "boards.json"
+        case .space(let id): return "boards.space-\(id).json"
+        }
+    }
+}
+
 enum AppDefaults {
     static let defaultFontName: String? = "System"   // 系统默认字体（苹方回退），最大兼容
     static let defaultFontSize: CGFloat = 22
@@ -60,18 +75,22 @@ enum AppDefaults {
     // MARK: 用户设置（UserDefaults）
 
     static let followAllSpacesKey = "followAllSpaces"
-    /// 画布内容是否跟随全部桌面 Space（开启 = 继承到每个桌面；关闭 = 仅存在于当前 Space）
+    /// 画布是否“在全部桌面 Space 显示”。
+    /// - true：所有桌面看到同一块全局画布（继承）；
+    /// - false：每个桌面各自独立画布，互不显示对方内容。
     static var followAllSpaces: Bool {
         get { UserDefaults.standard.object(forKey: followAllSpacesKey) as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: followAllSpacesKey) }
     }
 }
 
-/// 根据设置构造窗口的 Space 行为（两种窗口共用同一规则，保证壁纸层与编辑层一致）
+/// 根据设置/作用域构造窗口的 Space 行为。
+/// - 全局画布：跟随全部桌面（加入所有 Space）；
+/// - 某个 Space 的独立画布：仅停留在其创建时所在的 Space（天然如此，无需 canJoinAllSpaces）。
 enum SpaceBehavior {
-    static func collectionBehavior() -> NSWindow.CollectionBehavior {
+    static func collectionBehavior(joiningAllSpaces: Bool? = nil) -> NSWindow.CollectionBehavior {
         var b: NSWindow.CollectionBehavior = [.stationary, .ignoresCycle]
-        if AppDefaults.followAllSpaces {
+        if joiningAllSpaces ?? AppDefaults.followAllSpaces {
             b.insert(.canJoinAllSpaces)
         }
         return b
@@ -234,16 +253,23 @@ enum BoardLayout {
     }
 }
 
-// MARK: - Store（单一数据源 + 持久化）
+// MARK: - Store（单一数据源 + 按画布作用域持久化）
 
 final class BoardStore {
     static let didChange = Notification.Name("AcrylicBoard.didChange")
 
-    private(set) var items: [BoardItem] = []
     private(set) var directory: URL
     private(set) var imagesDirectory: URL
-    private let fileURL: URL
+
+    /// 当前生效作用域：全局画布 或 当前桌面(Space)的独立画布
+    private(set) var scope: BoardScope = .global
+
+    /// 各作用域的内存数据（惰性加载；只在访问过/切换到的桌面才载入）
+    private var boards: [BoardScope: [BoardItem]] = [:]
+
     private var saveTimer: Timer?
+    /// 最近一次变更所属的作用域，防抖落盘用（避免切桌面后才触发的保存写错文件）
+    private var pendingSaveScope: BoardScope?
     private var imageCache: [String: NSImage] = [:]
 
     let logger = Logger(subsystem: "local.AcrylicBoard", category: "store")
@@ -254,27 +280,76 @@ final class BoardStore {
             .appendingPathComponent("AcrylicBoard", isDirectory: true)
         directory = base
         imagesDirectory = base.appendingPathComponent("images", isDirectory: true)
-        fileURL = base.appendingPathComponent("boards.json")
         try? fm.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
-        load()
+        _ = loadBoardIfNeeded(.global)   // 预载全局画布（旧版 boards.json 数据）
     }
 
-    // MARK: 读取
+    // MARK: 作用域管理
 
-    func load() {
-        guard let data = try? Data(contentsOf: fileURL) else { return }
-        do {
-            let doc = try JSONDecoder().decode(BoardDocument.self, from: data)
-            items = doc.items.sorted { $0.zIndex < $1.zIndex }
-        } catch {
-            logger.error("boards.json 解码失败: \(error.localizedDescription)")
+    /// 当前作用域下的条目（兼容旧调用方）
+    var items: [BoardItem] { items(for: scope) }
+
+    /// 取某作用域的画布条目（惰性加载）
+    func items(for key: BoardScope) -> [BoardItem] {
+        loadBoardIfNeeded(key)
+        return boards[key] ?? []
+    }
+
+    /// 切换到指定作用域：先落盘上一个作用域数据，再载入目标作用域并通知刷新。
+    func setScope(_ key: BoardScope) {
+        saveNow()
+        guard scope != key else { return }
+        scope = key
+        _ = loadBoardIfNeeded(key)
+        NotificationCenter.default.post(name: BoardStore.didChange, object: self)
+    }
+
+    func hasScopeFile(_ key: BoardScope) -> Bool {
+        FileManager.default.fileExists(atPath: fileURL(for: key).path)
+    }
+
+    /// 把 A 作用域的内容整块复制到 B 作用域（迁移用），并立即落盘 B。
+    func assignContent(from fromKey: BoardScope, to toKey: BoardScope) {
+        guard fromKey != toKey else { return }
+        let source = items(for: fromKey)
+        boards[toKey] = source
+        save(board: toKey)
+    }
+
+    /// 从“跟随全局”首次切到某独立桌面时调用：若该桌面尚无数据文件，则把当前全局画布作为起点，
+    /// 保证“我现在看到的板子”不会凭空消失；已有数据的桌面保持独立不受影响。
+    func seedFromGlobalIfNeeded(into key: BoardScope) {
+        guard case .space = key else { return }
+        guard !hasScopeFile(key) else { return }
+        let source = items(for: .global)
+        guard !source.isEmpty else { return }
+        boards[key] = source
+        save(board: key)
+    }
+
+    @discardableResult
+    private func loadBoardIfNeeded(_ key: BoardScope) -> [BoardItem]? {
+        if boards[key] != nil { return boards[key] }
+        var loaded: [BoardItem] = []
+        let url = fileURL(for: key)
+        if let data = try? Data(contentsOf: url) {
+            do {
+                let doc = try JSONDecoder().decode(BoardDocument.self, from: data)
+                loaded = doc.items.sorted { $0.zIndex < $1.zIndex }
+            } catch {
+                logger.error("\(key.fileName) 解码失败: \(error.localizedDescription)")
+            }
         }
+        boards[key] = loaded
+        return loaded
     }
 
     // MARK: 写入（防抖 + 原子替换）
 
     func scheduleSave() {
+        let key = pendingSaveScope ?? scope
         saveTimer?.invalidate()
+        pendingSaveScope = key
         saveTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
             self?.saveNow()
         }
@@ -283,25 +358,36 @@ final class BoardStore {
     func saveNow() {
         saveTimer?.invalidate()
         saveTimer = nil
+        let key = pendingSaveScope ?? scope
+        pendingSaveScope = nil
+        save(board: key)
+    }
+
+    private func save(board key: BoardScope) {
+        guard let data = boards[key] else { return }
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(BoardDocument(items: items))
-            try data.write(to: fileURL, options: .atomic)
+            let encoded = try encoder.encode(BoardDocument(items: data))
+            try encoded.write(to: fileURL(for: key), options: .atomic)
         } catch {
-            logger.error("写入 boards.json 失败: \(error.localizedDescription)")
+            logger.error("写入 \(key.fileName) 失败: \(error.localizedDescription)")
         }
     }
 
     // MARK: 变更
 
     func upsert(_ item: BoardItem) {
-        if let i = items.firstIndex(where: { $0.id == item.id }) {
-            items[i] = item
+        let key = boardScope(of: item.id) ?? scope
+        var arr = boards[key] ?? (loadBoardIfNeeded(key) ?? [])
+        if let i = arr.firstIndex(where: { $0.id == item.id }) {
+            arr[i] = item
         } else {
-            items.append(item)
-            items.sort { $0.zIndex < $1.zIndex }
+            arr.append(item)
+            arr.sort { $0.zIndex < $1.zIndex }
         }
+        boards[key] = arr
+        pendingSaveScope = key
         scheduleSave()
         NotificationCenter.default.post(name: BoardStore.didChange, object: self)
     }
@@ -314,37 +400,53 @@ final class BoardStore {
     }
 
     func remove(id: UUID) {
-        if let idx = items.firstIndex(where: { $0.id == id }) {
-            let removed = items.remove(at: idx)
+        guard let key = boardScope(of: id) else { return }
+        var arr = boards[key] ?? []
+        if let idx = arr.firstIndex(where: { $0.id == id }) {
+            let removed = arr.remove(at: idx)
             if let f = removed.imageFile {
                 try? FileManager.default.removeItem(at: imagesDirectory.appendingPathComponent(f))
                 imageCache.removeValue(forKey: f)
             }
+            boards[key] = arr
+            pendingSaveScope = key
             scheduleSave()
             NotificationCenter.default.post(name: BoardStore.didChange, object: self)
         }
     }
 
     func clearAll() {
-        for item in items {
+        let key = scope
+        let arr = boards[key] ?? (loadBoardIfNeeded(key) ?? [])
+        for item in arr {
             if let f = item.imageFile {
                 try? FileManager.default.removeItem(at: imagesDirectory.appendingPathComponent(f))
                 imageCache.removeValue(forKey: f)
             }
         }
-        items.removeAll()
+        boards[key] = []
+        pendingSaveScope = key
         scheduleSave()
         NotificationCenter.default.post(name: BoardStore.didChange, object: self)
     }
 
+    private func boardScope(of id: UUID) -> BoardScope? {
+        for (key, arr) in boards where arr.contains(where: { $0.id == id }) {
+            return key
+        }
+        return nil
+    }
+
     // MARK: 数据自检
 
-    /// 对历史文字卡做“高度体检”：高度不足以容纳当前文字时，按文字实际排版补足（顶部锚定）。
-    /// 旧数据可能存了偏小的 frame 高，导致桌面文字末行与编辑视图被容器截断。
+    /// 对“当前作用域”历史文字卡做高度体检：高度不足容纳当前文字时按实际排版补足（顶部锚定）。
     func healTextHeights() {
+        let key = scope
+        _ = loadBoardIfNeeded(key)
+        guard var arr = boards[key] else { return }
         var changed = false
-        for i in items.indices where items[i].kind == .text && !items[i].text.isEmpty {
-            let it = items[i]
+        for i in arr.indices where arr[i].kind == .text && !arr[i].text.isEmpty {
+            let it = arr[i]
             let font = AppFonts.font(name: it.fontName, size: it.fontSize, bold: it.isBold)
             let needed = TextLayout.height(text: it.text, font: font, width: max(60, it.frame.width))
             if it.frame.height < needed - 1 {
@@ -352,11 +454,13 @@ final class BoardStore {
                 let top = fixed.frame.maxY
                 fixed.frame.size.height = needed
                 fixed.frame.origin.y = top - needed
-                items[i] = fixed
+                arr[i] = fixed
                 changed = true
             }
         }
         if changed {
+            boards[key] = arr
+            pendingSaveScope = key
             saveNow()
             NotificationCenter.default.post(name: BoardStore.didChange, object: self)
         }
@@ -412,6 +516,10 @@ final class BoardStore {
         let h = max(8, img.size.height)
         let scale = min(1, maxSide / max(w, h))
         return CGRect(x: 0, y: 0, width: (w * scale).rounded(), height: (h * scale).rounded())
+    }
+
+    private func fileURL(for key: BoardScope) -> URL {
+        directory.appendingPathComponent(key.fileName)
     }
 
     private static func downsampledPNG(_ cg: CGImage, maxLongSide: CGFloat = 2560) -> Data? {

@@ -7,14 +7,20 @@ import os.log
 /// - 只做“静态渲染”，一切写入都由浮层编辑窗口完成
 final class WallpaperWindowController {
     private let store: BoardStore
+    private let scope: BoardScope
     private let window: BoardWindow
     private var itemViews: [UUID: NSView] = [:]
     private var editing = false
     private var observers: [NSObjectProtocol] = []
     let logger = Logger(subsystem: "local.AcrylicBoard", category: "wallpaper")
 
-    init(store: BoardStore) {
+    /// - Parameters:
+    ///   - store: 数据源
+    ///   - scope: 本窗口负责渲染的画布作用域（全局 或 某桌面 Space 的独立画布）。
+    ///            窗口创建于“当前活跃 Space”，因此 space 作用域窗口会自然归属其桌面。
+    init(store: BoardStore, scope: BoardScope = .global) {
         self.store = store
+        self.scope = scope
         let screen = NSScreen.main ?? NSScreen.screens.first
         let frame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
 
@@ -28,7 +34,8 @@ final class WallpaperWindowController {
         window.isMovable = false
         window.canHide = false
         window.isReleasedWhenClosed = false
-        window.collectionBehavior = SpaceBehavior.collectionBehavior()
+        // 仅全局画布才加入所有 Space；独立桌面画布只停留其所在桌面
+        window.collectionBehavior = SpaceBehavior.collectionBehavior(joiningAllSpaces: scope == .global)
         window.ignoresMouseEvents = true
         window.contentView = NSView(frame: NSRect(origin: .zero, size: frame.size))
         window.orderFrontRegardless()
@@ -37,9 +44,14 @@ final class WallpaperWindowController {
         rebuild()
     }
 
+    /// 释放本窗口（切换模式/桌面后不再需要时调用）
+    func tearDown() {
+        window.orderOut(nil)
+    }
+
     /// 用户切换“是否跟随全部桌面 Space”后调用，实时更新壁纸层窗口归属
     func applySpaceBehavior() {
-        window.collectionBehavior = SpaceBehavior.collectionBehavior()
+        window.collectionBehavior = SpaceBehavior.collectionBehavior(joiningAllSpaces: scope == .global)
         // 从“加入所有 Space”切到“仅当前 Space”等情形下重新注册窗口归属
         window.orderFrontRegardless()
     }
@@ -96,7 +108,7 @@ final class WallpaperWindowController {
         guard let content = window.contentView, content.frame.width > 0 else { return }
 
         let origin = window.frame.origin   // 与 item.frame 同一全局坐标系
-        let sorted = store.items.sorted { $0.zIndex < $1.zIndex }
+        let sorted = store.items(for: scope).sorted { $0.zIndex < $1.zIndex }
         for item in sorted {
             if item.kind == .text {
                 if item.text.isEmpty { continue }

@@ -7,11 +7,16 @@ import os.log
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = BoardStore()
     private var wallpaper: WallpaperWindowController!
+    /// “各桌面独立”模式下，按桌面(Space ID)持有各自的壁纸窗口
+    private var spaceWallpapers: [SpaceManager.SpaceID: WallpaperWindowController] = [:]
+    private var lastActiveSpaceID: SpaceManager.SpaceID = 0
+    private var activeSpaceObserver: NSObjectProtocol?
     private var controllers: [UUID: ItemEditorWindowController] = [:]
     private var statusItem: NSStatusItem!
     private var toggleItem: NSMenuItem?
     private var launchItem: NSMenuItem?
     private var spaceItem: NSMenuItem?
+    private var updateItem: NSMenuItem?
     private var localMonitors: [Any] = []
     private var newImageObserver: NSObjectProtocol?
     private(set) var isEditing = false
@@ -23,12 +28,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
+        // 依据设置建立画布模式（全局 / 当前桌面独立），并按作用域创建壁纸窗口
+        configureSpaceMode()
         // 启动先修正历史数据里高度不足的文字卡，避免文字末行/换行被容器截断
         store.healTextHeights()
-        wallpaper = WallpaperWindowController(store: store)
         buildMainMenu()
         buildStatusItem()
         registerGlobalHotkeys()
+        observeSpaceChanges()
 
         newImageObserver = NotificationCenter.default.addObserver(
             forName: .acrylicBoardShouldEditNew, object: nil, queue: .main
@@ -145,6 +152,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         about.target = self
         menu.addItem(about)
 
+        let update = NSMenuItem(title: "检查更新…", action: #selector(checkForUpdates(_:)), keyEquivalent: "")
+        update.target = self
+        updateItem = update
+        menu.addItem(update)
+
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
@@ -164,14 +176,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - 设置：画布是否跟随全部桌面 Space（继承/不继承）
+    // 开 = 所有桌面共享同一块全局画布；关 = 每个桌面各自独立画布（互不显示对方内容），即时生效。
 
     @objc func toggleFollowAllSpaces(_ sender: Any?) {
-        AppDefaults.followAllSpaces.toggle()
-        wallpaper.applySpaceBehavior()
-        for c in controllers.values {
-            c.applySpaceBehavior()
+        if isEditing { exitEditing() }   // 先收起并保存当前编辑，避免浮层归属错乱
+        if AppDefaults.followAllSpaces {
+            enterIndependentMode()
+        } else {
+            enterFollowMode(promoteCurrentSpace: true)
         }
+        store.healTextHeights()
         refreshMenuState()
+    }
+
+    private func configureSpaceMode() {
+        if AppDefaults.followAllSpaces {
+            enterFollowMode(promoteCurrentSpace: false)
+        } else {
+            enterIndependentMode()
+        }
+    }
+
+    /// 进入“跟随全部桌面”：单一全局画布，窗口加入所有 Space。
+    private func enterFollowMode(promoteCurrentSpace: Bool) {
+        AppDefaults.followAllSpaces = true
+        let sid = SpaceManager.activeSpaceID()
+        // 由“独立桌面”切回时：把当前所在桌面的独立画布升级为全局画布（用户正看的那块板）
+        if promoteCurrentSpace, store.hasScopeFile(.space(sid)) {
+            store.assignContent(from: .space(sid), to: .global)
+        }
+        store.setScope(.global)
+        teardownAllWallpapers()
+        wallpaper = WallpaperWindowController(store: store, scope: .global)
+        lastActiveSpaceID = sid
+    }
+
+    /// 进入“各桌面独立”：当前桌面获得独立画布；此后切到哪个桌面就显示哪块的独立内容。
+    private func enterIndependentMode() {
+        AppDefaults.followAllSpaces = false
+        let sid = SpaceManager.activeSpaceID()
+        // 若当前桌面还没有独立数据（首次从全局切分），把现全局画布作为该桌面起点
+        store.seedFromGlobalIfNeeded(into: .space(sid))
+        store.setScope(.space(sid))
+        teardownAllWallpapers()
+        let w = WallpaperWindowController(store: store, scope: .space(sid))
+        spaceWallpapers[sid] = w
+        wallpaper = w
+        lastActiveSpaceID = sid
+    }
+
+    private func teardownAllWallpapers() {
+        wallpaper?.tearDown()
+        wallpaper = nil
+        for w in spaceWallpapers.values { w.tearDown() }
+        spaceWallpapers.removeAll()
+    }
+
+    private func observeSpaceChanges() {
+        let ws = NSWorkspace.shared.notificationCenter
+        activeSpaceObserver = ws.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleActiveSpaceChange()
+        }
+    }
+
+    /// 独立模式下切换桌面：收起当前桌面编辑 → 切换数据作用域 → 保证该桌面壁纸窗口存在。
+    private func handleActiveSpaceChange() {
+        guard !AppDefaults.followAllSpaces else { return }   // 跟随模式整板跨桌面可见，无需换板
+        let sid = SpaceManager.activeSpaceID()
+        guard sid != lastActiveSpaceID else { return }
+
+        if isEditing { exitEditing() }   // 保存并收起上一桌面的编辑浮层
+        lastActiveSpaceID = sid
+        store.setScope(.space(sid))
+
+        if let existing = spaceWallpapers[sid] {
+            existing.reassert()
+            wallpaper = existing
+        } else {
+            let w = WallpaperWindowController(store: store, scope: .space(sid))
+            spaceWallpapers[sid] = w
+            wallpaper = w
+        }
     }
 
     // MARK: - 全局快捷键
@@ -389,6 +477,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "亚克力记录板 v\(v)"
         alert.informativeText = "一块透明的桌面记录板：文字与图片垫在桌面图标之下、所有窗口之下，平时点击穿透；⌘⇧B 进入编辑模式书写与擦除。"
         alert.runModal()
+    }
+
+    // MARK: - 检查更新（仅手动触发，不常驻网络）
+
+    @objc func checkForUpdates(_ sender: Any?) {
+        updateItem?.isEnabled = false
+        updateItem?.title = "正在检查更新…"
+
+        UpdateService.fetchLatest { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.updateItem?.isEnabled = true
+                self.updateItem?.title = "检查更新…"
+                self.presentUpdateResult(result)
+            }
+        }
+    }
+
+    private func presentUpdateResult(_ result: Result<UpdateService.ReleaseInfo, Error>) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        switch result {
+        case .failure(let error):
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "无法检查更新"
+            alert.informativeText = (error as? UpdateService.CheckError)?.errorDescription
+                ?? error.localizedDescription
+            alert.addButton(withTitle: "好")
+            alert.runModal()
+
+        case .success(let info):
+            if UpdateService.isNewer(info.version, than: UpdateService.currentVersion) {
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = "发现新版本 \(info.version)"
+                var text = "当前版本 \(UpdateService.currentVersion)，最新版本 \(info.version)。\n"
+                if let body = info.body, !body.isEmpty {
+                    let preview = body.count > 900 ? String(body.prefix(900)) + "…" : body
+                    text += "\n更新内容：\n\(preview)"
+                }
+                alert.informativeText = text
+                alert.addButton(withTitle: "下载安装包")
+                alert.addButton(withTitle: "稍后再说")
+                if alert.runModal() == .alertFirstButtonReturn, let url = info.dmgDownloadURL {
+                    NSWorkspace.shared.open(url)
+                }
+                return
+            }
+
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "已是最新版本"
+            alert.informativeText = "当前已安装 v\(UpdateService.currentVersion)，无需更新。"
+            alert.addButton(withTitle: "好")
+            alert.runModal()
+        }
     }
 
     @objc func quit() {
