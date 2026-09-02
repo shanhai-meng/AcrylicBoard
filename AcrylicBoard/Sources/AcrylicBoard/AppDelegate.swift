@@ -11,6 +11,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var spaceWallpapers: [SpaceManager.SpaceID: WallpaperWindowController] = [:]
     private var lastActiveSpaceID: SpaceManager.SpaceID = 0
     private var activeSpaceObserver: NSObjectProtocol?
+    /// 独立模式下的自愈轮询：偶尔系统不派发 activeSpaceDidChange（或通知过早、值还是旧桌面），
+    /// 轮询可在切桌面的下一秒把作用域纠正到正确桌面。
+    private var spacePoller: Timer?
     private var controllers: [UUID: ItemEditorWindowController] = [:]
     private var statusItem: NSStatusItem!
     private var toggleItem: NSMenuItem?
@@ -200,6 +203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 进入“跟随全部桌面”：单一全局画布，窗口加入所有 Space。
     private func enterFollowMode(promoteCurrentSpace: Bool) {
         AppDefaults.followAllSpaces = true
+        stopSpacePoller()
         let sid = SpaceManager.activeSpaceID()
         // 由“独立桌面”切回时：把当前所在桌面的独立画布升级为全局画布（用户正看的那块板）
         if promoteCurrentSpace, store.hasScopeFile(.space(sid)) {
@@ -215,6 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func enterIndependentMode() {
         AppDefaults.followAllSpaces = false
         let sid = SpaceManager.activeSpaceID()
+        SpaceTrace.log("进入独立模式，当前桌面 space=\(sid)")
         // 若当前桌面还没有独立数据（首次从全局切分），把现全局画布作为该桌面起点
         store.seedFromGlobalIfNeeded(into: .space(sid))
         store.setScope(.space(sid))
@@ -223,6 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spaceWallpapers[sid] = w
         wallpaper = w
         lastActiveSpaceID = sid
+        startSpacePoller()
     }
 
     private func teardownAllWallpapers() {
@@ -242,21 +248,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 独立模式下切换桌面：收起当前桌面编辑 → 切换数据作用域 → 保证该桌面壁纸窗口存在。
+    /// 独立模式下切换桌面：等 Space 状态稳定后再采样同步（动画期间可能还读到旧桌面）。
     private func handleActiveSpaceChange() {
         guard !AppDefaults.followAllSpaces else { return }   // 跟随模式整板跨桌面可见，无需换板
-        let sid = SpaceManager.activeSpaceID()
-        guard sid != lastActiveSpaceID else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.syncToCurrentSpace(reason: "activeSpaceDidChange")
+        }
+    }
 
-        if isEditing { exitEditing() }   // 保存并收起上一桌面的编辑浮层
+    /// 连续采样到 activeSpaceID=0 的次数；≥3 次判定为探测不可用，自动退化为全局画布
+    private var consecutiveZero = 0
+    /// 上一次采样到的非零桌面 ID（用于日志，判断桌面间是否确实不同）
+    private var lastSampledSpaceID: SpaceManager.SpaceID = 0
+
+    /// 独立模式下的自愈轮询（跟随模式不启用）
+    private func startSpacePoller() {
+        guard AppDefaults.followAllSpaces == false else { return }
+        spacePoller?.invalidate()
+        let poller = Timer(timeInterval: 1.2, repeats: true) { [weak self] _ in
+            self?.syncToCurrentSpace(reason: "poller")
+        }
+        RunLoop.main.add(poller, forMode: .common)
+        spacePoller = poller
+        SpaceTrace.log("独立模式：启动空间轮询")
+    }
+
+    private func stopSpacePoller() {
+        spacePoller?.invalidate()
+        spacePoller = nil
+    }
+
+    /// 独立模式：把「数据作用域 + 当前壁纸窗口」同步到此刻真正活跃的桌面 Space。
+    /// 无论数据落在哪个 scope 文件里，最终渲染都会遵循这里采样到的桌面。
+    /// 调用时机：收到 Space 切换通知（延迟后）、周期性自愈、以及进入编辑/新建等用户动作前。
+    private func syncToCurrentSpace(reason: String) {
+        guard !AppDefaults.followAllSpaces else { return }
+        let sid = SpaceManager.activeSpaceID()
+        if sid == 0 {
+            // 探测失败：不要轻率地新建 space-0 画布。连续多次仍取不到才退化为全局画布，
+            // 避免单次瞬时失败误切换。
+            consecutiveZero += 1
+            SpaceTrace.log("探测异常 activeSpaceID=0（第\(consecutiveZero)次，reason=\(reason)）")
+            if consecutiveZero >= 3 {
+                SpaceTrace.log("连续探测失败≥3次，退化为全局画布")
+                enterFollowMode(promoteCurrentSpace: false)
+            }
+            return
+        }
+        consecutiveZero = 0
+        if sid != lastSampledSpaceID {
+            // 记录新桌面采样（含双 API 原始值），便于验证探测是否随桌面变化
+            let d = SpaceManager.diagnosticSample()
+            SpaceTrace.log("采样新桌面 space=\(sid) (getActive=\(d.getActive), copyActive=\(d.copyActive), reason=\(reason))")
+            lastSampledSpaceID = sid
+        }
+        let target: BoardScope = .space(sid)
+
+        if store.scope != target {
+            SpaceTrace.log("切换作用域 \(store.scope.fileName) -> \(target.fileName) (reason=\(reason))")
+            if isEditing { exitEditing() }   // 收起上一桌面的编辑浮层（含保存）
+            store.setScope(target)
+        }
         lastActiveSpaceID = sid
-        store.setScope(.space(sid))
 
         if let existing = spaceWallpapers[sid] {
-            existing.reassert()
             wallpaper = existing
         } else {
-            let w = WallpaperWindowController(store: store, scope: .space(sid))
+            SpaceTrace.log("为桌面 \(sid) 创建壁纸窗口 (reason=\(reason))")
+            let w = WallpaperWindowController(store: store, scope: target)
             spaceWallpapers[sid] = w
             wallpaper = w
         }
@@ -287,6 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func enterEditing() {
         guard !isEditing else { return }
+        syncToCurrentSpace(reason: "enterEditing")   // 编辑前锚定当前桌面，避免编辑到别的桌面画布
         isEditing = true
         wallpaper.setEditing(true)
         for item in store.items {
@@ -387,6 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func addText(_ sender: Any?) {
+        syncToCurrentSpace(reason: "addText")   // 内容写在“当前所在桌面”的画布
         let rect = defaultContentRect(width: 320, height: 44)
         let item = store.addText("", frame: rect, zIndex: store.items.count)
         if !isEditing { enterEditing() }
@@ -418,6 +479,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func addImageItem(from url: URL) {
+        syncToCurrentSpace(reason: "importImage")   // 图片落在“当前所在桌面”的画布
         guard let fileName = store.importImage(from: url) else {
             beep("无法读取该图片")
             return
@@ -426,6 +488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func addImageItem(fileName: String) {
+        syncToCurrentSpace(reason: "addImage")   // 图片落在“当前所在桌面”的画布
         guard let fit = store.fitFrame(forImageNamed: fileName, maxSide: 560) else { return }
         let screen = NSScreen.main ?? NSScreen.screens.first!
         let centered = CGRect(x: screen.frame.midX - fit.width / 2,
@@ -467,6 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "取消")
         if alert.runModal() == .alertFirstButtonReturn {
             exitEditing()
+            syncToCurrentSpace(reason: "clearAll")   // 清的是“当前所在桌面”的画布
             store.clearAll()
         }
     }
