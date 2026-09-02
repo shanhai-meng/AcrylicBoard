@@ -205,6 +205,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     private func spawnEditor(for item: BoardItem, focus: Bool) -> ItemEditorWindowController? {
         guard isEditing else { return nil }
+        // 同一 item 已存在编辑窗时直接复用，避免生成重复/不受控的“孤儿”窗口
+        if let existing = controllers[item.id] {
+            existing.show(focus: focus)
+            return existing
+        }
         guard let c = ItemEditorWindowController(store: store, item: item) else { return nil }
         controllers[item.id] = c
         c.onDelete = { [weak self] id in self?.deleteItem(id) }
