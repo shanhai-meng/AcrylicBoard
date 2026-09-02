@@ -186,10 +186,15 @@ final class ItemEditorWindowController: NSObject {
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        window.collectionBehavior = SpaceBehavior.collectionBehavior()
         window.hidesOnDeactivate = false
         window.delegate = self
         window.contentView = root
+    }
+
+    /// 用户切换“是否跟随全部桌面 Space”后调用，实时更新本编辑浮层归属
+    func applySpaceBehavior() {
+        window.collectionBehavior = SpaceBehavior.collectionBehavior()
     }
 
     private func buildUI() {
@@ -488,9 +493,12 @@ final class ItemEditorWindowController: NSObject {
 
         if kind == .image {
             var content = current.frame
-            content.size.width = max(minW, content.width + dx)
+            // 右下角手柄：屏幕坐标 y 向上，向下拖为负。取“位移主方向”作为宽度增量：
+            // 斜向拖 / 纯横向拖 → 用 dx；纯纵向拖（|dy|>|dx|）→ 用 -dy，向下 = 放大。
+            let dw: CGFloat = abs(dx) >= abs(dy) ? dx : -dy
+            content.size.width = max(minW, content.width + dw)
             content.size.height = content.width * currentImageAspect
-            content.origin.y = top - content.size.height   // 顶部锚定，避免越拖越高
+            content.origin.y = top - content.size.height   // 顶部锚定：放大时向下延展
             current.frame = content
             store.upsert(current)
             applyWindowFrameFromContent()
@@ -504,8 +512,9 @@ final class ItemEditorWindowController: NSObject {
         let autoH = TextLayout.height(text: current.text, font: font, width: width)
 
         if abs(dy) >= 0.5 {
-            // 纵向拖动：直接设定高度；拖不低过文字所需
-            let h = max(autoH, current.frame.height + dy)
+            // 纵向拖动：屏幕坐标 y 向上，向下拖为负 → 取反后“向下 = 加高并向下延伸”。
+            // 直接设定高度，但不低于文字排版所需高度。
+            let h = max(autoH, current.frame.height - dy)
             pinnedTextHeight = h > autoH + 0.5 ? h : nil
         }
         // 纯横向拖动：让 resolveTextHeight 决定（pin 保留 / auto 自动）

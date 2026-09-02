@@ -27,7 +27,7 @@ macOS 13+（Apple Silicon）用户可直接到 GitHub Releases 页下载安装�
 
 - **下载地址**：https://github.com/shanhai-meng/AcrylicBoard/releases
 
-双击 `AcrylicBoard-v1.0.1.dmg` → 把 `AcrylicBoard` 拖入「应用程序」即完成安装。若系统提示"无法验证开发者"，对应用右键 →「打开」一次即可（ad-hoc 签名的正常提示）。
+双击 `AcrylicBoard-v1.0.2.dmg` → 把 `AcrylicBoard` 拖入「应用程序」即完成安装。若系统提示"无法验证开发者"，对应用右键 →「打开」一次即可（ad-hoc 签名的正常提示）。
 
 ### 方式 B：Swift 直接编译运行（开发调试）
 
@@ -71,7 +71,9 @@ swift run --package-path AcrylicBoard
 
 ### 持久化
 
-所有内容在输入/移动/缩放/换样式后 0.4 秒内自动保存，无需手动存档。重启应用或重启电脑后原样恢复，并且所有桌面 Space 里都能看到同一块板。
+所有内容在输入/移动/缩放/换样式后 0.4 秒内自动保存，无需手动存档。重启应用或重启电脑后原样恢复。
+
+- **跨桌面 Space**：默认画布跟随所有桌面 Space（切到任一桌面都能看到同一块板）；可在菜单栏取消「在全部桌面 Space 显示画布」让它只留在当前桌面。
 
 > 提示：菜单栏 →「打开数据文件夹」可直接查看 `boards.json` 与 `images/`，方便备份或手工编辑。
 
@@ -114,7 +116,7 @@ rm -rf "$HOME/Library/Application Support/AcrylicBoard"
 
 - **一份数据 + 双窗口表现**：数据模型 `BoardStore` 是唯一数据源（JSON 原子落盘）；「壁纸层窗口」负责静态渲染，位于桌面层（点击穿透、不可聚焦、不可见键盘输入）；编辑时每条内容对应一个「浮层编辑窗」，承载真正的 `NSTextView` 输入（天然支持中文 IME 候选框定位）。
 - **坐标体系**：内容矩形 `frame` 统一使用主屏全局坐标（与 `NSScreen.frame` 同坐标系），壁纸层与编辑层经同一套 `BoardLayout` 几何换算，保证「编辑所见 = 壁纸所得」。
-- **窗口层级**：壁纸层 `level = CGWindowLevelForKey(.desktopIconWindow) - 1`，`ignoresMouseEvents = true`，`collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]`，不干扰任何桌面操作，也不出现在 Mission Control / Cmd+Tab。
+- **窗口层级**：壁纸层 `level = CGWindowLevelForKey(.desktopIconWindow) - 1`，`ignoresMouseEvents = true`，Space 行为按设置取 `.canJoinAllSpaces`（默认开启，可在菜单栏关闭），不干扰任何桌面操作，也不出现在 Mission Control / Cmd+Tab。
 - **全局快捷键**：Carbon `RegisterEventHotKey` 注册 `⌘⇧B / ⌘⇧N / ⌘⇧V`，无需「辅助功能」权限。
 - **渲染一致性**：壁纸层与编辑层共用同一 `TextLayout`（`NSLayoutManager`）测量换行高度，保证字体行距、折行完全一致。
 - **日志**：`os.Logger` 仅记录模式切换与持久化错误，不落盘任何内容隐私；写盘为原子替换，防止崩溃损坏 JSON。
@@ -134,6 +136,6 @@ rm -rf "$HOME/Library/Application Support/AcrylicBoard"
 - [ ] 拖动手柄移动条目、右下角缩放（文字换行重排 / 图片等比缩放），壁纸层同步。
 - [ ] `⌘⌫` 删除当前卡片、格式条 `✕` 删除、菜单「清空画布…」均生效。
 - [ ] 重启应用后所有内容（文字样式与位置、图片）原样恢复。
-- [ ] 切换多个桌面 Space：内容在每个 Space 都可见且位于图标之下。
+- [ ] 切换多个桌面 Space：默认每个 Space 都可见且位于图标之下；取消菜单栏「在全部桌面 Space 显示画布」后只在当前桌面显示。
 - [ ] 打开「开机自启」后重启电脑，应用随登录自动出现。
 - [ ] 查看 `~/Library/Application Support/AcrylicBoard/boards.json`：内容完整、格式合法。

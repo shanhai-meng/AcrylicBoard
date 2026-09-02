@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var toggleItem: NSMenuItem?
     private var launchItem: NSMenuItem?
+    private var spaceItem: NSMenuItem?
     private var localMonitors: [Any] = []
     private var newImageObserver: NSObjectProtocol?
     private(set) var isEditing = false
@@ -129,6 +130,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         launchItem = launch
         menu.addItem(launch)
 
+        let space = NSMenuItem(title: "在全部桌面 Space 显示画布", action: #selector(toggleFollowAllSpaces(_:)), keyEquivalent: "")
+        space.target = self
+        spaceItem = space
+        menu.addItem(space)
+
         let clear = NSMenuItem(title: "清空画布…", action: #selector(clearAll(_:)), keyEquivalent: "")
         clear.target = self
         menu.addItem(clear)
@@ -154,6 +160,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleItem?.title = isEditing ? "退出编辑模式" : "进入编辑模式"
         let enabled = SMAppService.mainApp.status == .enabled
         launchItem?.state = enabled ? .on : .off
+        spaceItem?.state = AppDefaults.followAllSpaces ? .on : .off
+    }
+
+    // MARK: - 设置：画布是否跟随全部桌面 Space（继承/不继承）
+
+    @objc func toggleFollowAllSpaces(_ sender: Any?) {
+        AppDefaults.followAllSpaces.toggle()
+        wallpaper.applySpaceBehavior()
+        for c in controllers.values {
+            c.applySpaceBehavior()
+        }
+        refreshMenuState()
     }
 
     // MARK: - 全局快捷键

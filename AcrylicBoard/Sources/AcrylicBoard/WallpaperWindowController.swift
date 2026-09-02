@@ -28,13 +28,20 @@ final class WallpaperWindowController {
         window.isMovable = false
         window.canHide = false
         window.isReleasedWhenClosed = false
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        window.collectionBehavior = SpaceBehavior.collectionBehavior()
         window.ignoresMouseEvents = true
         window.contentView = NSView(frame: NSRect(origin: .zero, size: frame.size))
         window.orderFrontRegardless()
 
         subscribe()
         rebuild()
+    }
+
+    /// 用户切换“是否跟随全部桌面 Space”后调用，实时更新壁纸层窗口归属
+    func applySpaceBehavior() {
+        window.collectionBehavior = SpaceBehavior.collectionBehavior()
+        // 从“加入所有 Space”切到“仅当前 Space”等情形下重新注册窗口归属
+        window.orderFrontRegardless()
     }
 
     private func subscribe() {

@@ -56,6 +56,26 @@ enum AppDefaults {
     static let defaultFontSize: CGFloat = 22
     static let defaultTextColor = "#FFFFFF"
     static let defaultBold = true
+
+    // MARK: 用户设置（UserDefaults）
+
+    static let followAllSpacesKey = "followAllSpaces"
+    /// 画布内容是否跟随全部桌面 Space（开启 = 继承到每个桌面；关闭 = 仅存在于当前 Space）
+    static var followAllSpaces: Bool {
+        get { UserDefaults.standard.object(forKey: followAllSpacesKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: followAllSpacesKey) }
+    }
+}
+
+/// 根据设置构造窗口的 Space 行为（两种窗口共用同一规则，保证壁纸层与编辑层一致）
+enum SpaceBehavior {
+    static func collectionBehavior() -> NSWindow.CollectionBehavior {
+        var b: NSWindow.CollectionBehavior = [.stationary, .ignoresCycle]
+        if AppDefaults.followAllSpaces {
+            b.insert(.canJoinAllSpaces)
+        }
+        return b
+    }
 }
 
 // MARK: - 颜色工具

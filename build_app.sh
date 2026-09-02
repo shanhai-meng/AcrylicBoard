@@ -31,6 +31,9 @@ mkdir -p "$BUNDLE_DIR/Contents/MacOS"
 mkdir -p "$BUNDLE_DIR/Contents/Resources"
 cp "$BIN" "$BUNDLE_DIR/Contents/MacOS/$PRODUCT"
 cp "$PKG_DIR/Info.plist" "$BUNDLE_DIR/Contents/Info.plist"
+if [ -d "$PKG_DIR/Resources" ]; then
+  cp -R "$PKG_DIR/Resources/." "$BUNDLE_DIR/Contents/Resources/"
+fi
 
 echo "==> ad-hoc codesign ..."
 codesign --force --deep --sign - "$BUNDLE_DIR"
