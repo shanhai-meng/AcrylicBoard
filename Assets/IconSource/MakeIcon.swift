@@ -1,8 +1,12 @@
 import Cocoa
 
 // 亚克力记录板 App 图标生成器
-// 设计遵循 macOS 大图标安全区：视觉主体居中，四周留白约 12%~15%，
-// 避免内容贴边导致在启动台 / 访达里观感比其它 App 图标“更大、更满”。
+//
+// 图标规范（本次按标准修正）：
+//   - 输出 1024×1024 源 PNG；
+//   - 图标主体（圆角底 + 板 + 装饰，即全部图形内容）居中，整体仅占画布 80%；
+//   - 四周各预留 10%（合计 20%）纯透明安全留白；
+//   - 禁止任何图形顶到画布四边。
 //
 // 用法: swift MakeIcon.swift <output.png>
 
@@ -14,16 +18,24 @@ guard arguments.count >= 2 else {
 
 let outputURL = URL(fileURLWithPath: arguments[1])
 let size: CGFloat = 1024
-let cornerRadius: CGFloat = 230
+let cornerRadius: CGFloat = 230        // 圆角底随 0.8 缩放后 ≈ 184
 
-// ---- 内容安全区：元素不超出 [edge, 1024 - edge] ----
-// macOS 图标中图形内容距边缘约 10% 起步；这里取 13%，与系统 App 视觉密度接近。
-let edge: CGFloat = 133
+// ---- 内容安全区：主体只占画布 80%，四周 20%（每边 10%）透明留白 ----
+let contentFraction: CGFloat = 0.8     // 主体占画布比例
+let inset: CGFloat = size * (1 - contentFraction) / 2   // = 102.4
 
 let icon = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
     // 透明背景
     NSColor.clear.setFill()
     rect.fill()
+
+    guard let ctx = NSGraphicsContext.current?.cgContext else { return true }
+
+    // 整体居中缩小到 80%：此后所有绘制（背景、板、文字、点缀）都在中央方块内，
+    // 四周自动留出 20% 透明安全边，绝不出界。
+    ctx.saveGState()
+    ctx.translateBy(x: inset, y: inset)
+    ctx.scaleBy(x: contentFraction, y: contentFraction)
 
     // ---- 圆角背景 ----
     let bgPath = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
@@ -37,12 +49,12 @@ let icon = NSImage(size: NSSize(width: size, height: size), flipped: false) { re
                                         NSColor(calibratedRed: 0.30, green: 0.25, blue: 0.55, alpha: 1).cgColor
                                     ] as CFArray,
                                     locations: [0.0, 0.5, 1.0]) else {
+        ctx.restoreGState()
         return true
     }
-    let ctx = NSGraphicsContext.current!.cgContext
     ctx.drawLinearGradient(gradient, start: CGPoint(x: 0, y: size), end: CGPoint(x: size, y: 0), options: [])
 
-    // ---- 毛玻璃/亚克力板（视觉主体，居中，占安全区中央 ~75%） ----
+    // ---- 毛玻璃/亚克力板（视觉主体，居中，占内容区中央 ~75%） ----
     let boardW: CGFloat = 470
     let boardH: CGFloat = 555
     let boardRect = NSRect(x: (size - boardW) / 2, y: (size - boardH) / 2,
@@ -136,22 +148,25 @@ let icon = NSImage(size: NSSize(width: size, height: size), flipped: false) { re
 
     ctx.restoreGState()
 
-    // ---- 散落小方块（点缀在板四周空隙，且都收在安全区内，不触边） ----
+    // ---- 散落小方块（点缀在板四周空隙；随整体缩至 80%，且都远在安全区内不触边） ----
     func confetti(_ r: NSRect, color: NSColor) {
         color.setFill()
         let p = NSBezierPath(roundedRect: r, xRadius: 7, yRadius: 7)
         p.fill()
     }
-    // 左右两侧各一、上方两颗（AppKit 坐标：y 向上）
-    confetti(NSRect(x: edge + 20,          y: 500 - 18, width: 34, height: 34),
-             color: NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.55, alpha: 0.9))
-    confetti(NSRect(x: edge + 66,          y: 886, width: 40, height: 40),
-             color: NSColor(calibratedRed: 0.45, green: 0.85, blue: 1.00, alpha: 0.9))
-    confetti(NSRect(x: size - edge - 66,   y: 472, width: 34, height: 34),
+    // 左右两侧各一、上方两颗，左右成镜像对称（AppKit 坐标：y 向上）
+    // 左侧靠板、右侧靠板（镜像），均收在中央 80% 内容区内
+    let leftRed = NSRect(x: 153, y: 482, width: 34, height: 34)          // 红
+    let leftBlue = NSRect(x: 199, y: 886, width: 40, height: 40)         // 青
+    confetti(leftRed, color: NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.55, alpha: 0.9))
+    confetti(leftBlue, color: NSColor(calibratedRed: 0.45, green: 0.85, blue: 1.00, alpha: 0.9))
+    // 右侧镜像：x = 1024 - (左侧 minX + width)
+    confetti(NSRect(x: 1024 - leftRed.maxX, y: leftRed.minY, width: leftRed.width, height: leftRed.height),
              color: NSColor(calibratedRed: 1.00, green: 0.85, blue: 0.40, alpha: 0.9))
-    confetti(NSRect(x: size - edge - 44,   y: 848, width: 38, height: 38),
+    confetti(NSRect(x: 1024 - leftBlue.maxX, y: leftBlue.minY, width: leftBlue.width, height: leftBlue.height),
              color: NSColor(calibratedRed: 0.55, green: 1.00, blue: 0.55, alpha: 0.85))
 
+    ctx.restoreGState()
     return true
 }
 
@@ -163,4 +178,4 @@ guard let tiff = icon.tiffRepresentation,
 }
 
 try data.write(to: outputURL)
-print("已生成程序化图标: \(outputURL.path)")
+print("已生成程序化图标(主体80%、四周20%留白): \(outputURL.path)")
