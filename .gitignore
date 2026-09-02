@@ -1,0 +1,19 @@
+# 构建产物
+.build/
+.swiftpm/
+AcrylicBoard.app/
+DerivedData/
+
+# 安装包
+*.dmg
+*.pkg
+
+# macOS
+.DS_Store
+
+# CodeBuddy 项目数据（不随源码上传）
+.codebuddy/
+
+# 系统生成
+*.swp
+*~
