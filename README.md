@@ -21,6 +21,14 @@
 
 产物为项目根目录的 `AcrylicBoard.app`（ad-hoc 签名，可直接双击运行）。
 
+### 方式 C：GitHub Release 直接下载（免编译，最省事）
+
+macOS 13+（Apple Silicon）用户可直接到 GitHub Releases 页下载安装包：
+
+- **下载地址**：https://github.com/shanhai-meng/AcrylicBoard/releases
+
+双击 `AcrylicBoard-v1.0.0.dmg` → 把 `AcrylicBoard` 拖入「应用程序」即完成安装。若系统提示"无法验证开发者"，对应用右键 →「打开」一次即可（ad-hoc 签名的正常提示）。
+
 ### 方式 B：Swift 直接编译运行（开发调试）
 
 ```bash
