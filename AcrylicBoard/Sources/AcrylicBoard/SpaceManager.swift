@@ -42,6 +42,37 @@ final class SpaceManager {
     static func diagnosticSample() -> (getActive: SpaceID, copyActive: SpaceID) {
         (activeSpace("CGSGetActiveSpace"), activeSpace("CGSCopyActiveSpace"))
     }
+
+    /// 当前系统“现存普通桌面”的 Space ID 集合（跨所有显示器）。
+    ///
+    /// 用只读私有符号 `CGSCopyManagedDisplaySpaces`（Hammerspoon 等多年稳定使用的读路径）
+    /// 枚举每块显示器下 `Spaces` 数组，取 `id64`，且只收普通桌面（type == 0）。
+    /// 用于在删除桌面时判断“我们缓存的某个桌面已不存在”，从而让该桌面的画布内容随之清除。
+    /// 任何一步失败返回 nil：调用方应跳过本轮清理，绝不因解析问题误删仍在的桌面。
+    static func existingUserSpaceIDs() -> Set<SpaceID>? {
+        typealias Fn = @convention(c) (UInt32) -> Unmanaged<CFArray>?
+        guard let handle, let sym = dlsym(handle, "CGSCopyManagedDisplaySpaces") else { return nil }
+        let cid = connectionID()
+        guard cid != 0 else { return nil }
+        guard let raw = unsafeBitCast(sym, to: Fn.self)(cid) else { return nil }
+        let array = raw.takeRetainedValue()
+        guard let displays = array as? [[String: Any]] else { return nil }
+
+        var ids = Set<SpaceID>()
+        for display in displays {
+            guard let spaces = display["Spaces"] as? [[String: Any]] else { continue }
+            for sp in spaces {
+                // type：0 = 普通桌面（user space）；4 = 全屏 Space。取不到 type 时保守保留。
+                if let type = sp["type"] as? Int, type != 0 { continue }
+                if let id64 = (sp["id64"] as? NSNumber)?.uint64Value {
+                    ids.insert(id64)
+                } else if let id64 = sp["id64"] as? SpaceID {
+                    ids.insert(id64)
+                }
+            }
+        }
+        return ids
+    }
 }
 
 /// 极轻量的 Space 追踪落盘（诊断用）：

@@ -327,6 +327,24 @@ final class BoardStore {
         save(board: key)
     }
 
+    /// 丢弃某桌面作用域：清掉其引用图片、内存缓存，并删除磁盘数据文件。
+    /// 用于系统删除桌面(Space)后，让该桌面的画布内容随之消失。
+    func discardScope(_ key: BoardScope) {
+        saveNow()   // 先落盘待保存内容，避免后续写回已删除作用域
+        let fm = FileManager.default
+        if let arr = boards[key] {
+            for item in arr {
+                if let f = item.imageFile {
+                    try? fm.removeItem(at: imagesDirectory.appendingPathComponent(f))
+                    imageCache.removeValue(forKey: f)
+                }
+            }
+        }
+        boards.removeValue(forKey: key)
+        try? fm.removeItem(at: fileURL(for: key))
+        NotificationCenter.default.post(name: BoardStore.didChange, object: self)
+    }
+
     @discardableResult
     private func loadBoardIfNeeded(_ key: BoardScope) -> [BoardItem]? {
         if boards[key] != nil { return boards[key] }

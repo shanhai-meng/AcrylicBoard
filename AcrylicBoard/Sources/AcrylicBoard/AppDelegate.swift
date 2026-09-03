@@ -266,7 +266,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard AppDefaults.followAllSpaces == false else { return }
         spacePoller?.invalidate()
         let poller = Timer(timeInterval: 1.2, repeats: true) { [weak self] _ in
-            self?.syncToCurrentSpace(reason: "poller")
+            guard let self else { return }
+            self.cleanupDeletedSpaces()
+            self.syncToCurrentSpace(reason: "poller")
         }
         RunLoop.main.add(poller, forMode: .common)
         spacePoller = poller
@@ -276,6 +278,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func stopSpacePoller() {
         spacePoller?.invalidate()
         spacePoller = nil
+    }
+
+    /// 独立模式：若系统已删除某个我们缓存了画布的桌面(Space)，其窗口会被系统挪到相邻桌面，
+    /// 导致“桌面 2 的内容跑到桌面 1”。此处定期比对缓存桌面与系统现存桌面：
+    /// 不存在的桌面 → 关掉壁纸窗口并清除其画布数据，内容随之消失。
+    private func cleanupDeletedSpaces() {
+        guard !AppDefaults.followAllSpaces, !spaceWallpapers.isEmpty else { return }
+        guard let existing = SpaceManager.existingUserSpaceIDs() else { return }
+        let deleted = spaceWallpapers.keys.filter { sid in
+            sid != lastActiveSpaceID && !existing.contains(sid)
+        }
+        guard !deleted.isEmpty else { return }
+        for sid in deleted {
+            SpaceTrace.log("检测到桌面 space=\(sid) 已删除，清除其画布内容")
+            let w = spaceWallpapers[sid]
+            w?.tearDown()
+            if wallpaper === w { wallpaper = nil }
+            spaceWallpapers.removeValue(forKey: sid)
+            store.discardScope(.space(sid))
+            if store.scope == .space(sid) {
+                store.setScope(.global)   // 防御：正常情况不会停留在已删除桌面
+            }
+        }
     }
 
     /// 独立模式：把「数据作用域 + 当前壁纸窗口」同步到此刻真正活跃的桌面 Space。
@@ -361,11 +386,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard isEditing else { return }
         isEditing = false
         removeLocalMonitors()
+        purgeEmptyTextItems()   // 先清空卡，再统一收尾，避免残留空窗口下次进入又出现
         for (_, c) in controllers { c.close() }
         controllers.removeAll()
         wallpaper.setEditing(false)
         store.saveNow()
         refreshMenuState()
+    }
+
+    /// 退出编辑时，把板上“没有任何文字内容”的文字卡一并删除：
+    /// 新建后没填写就退出 / 历史遗留的空占位卡，都不应留着等下次进入编辑时再冒出来。
+    private func purgeEmptyTextItems() {
+        for item in store.items where item.kind == .text {
+            let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard text.isEmpty else { continue }
+            controllers[item.id]?.close()
+            controllers.removeValue(forKey: item.id)
+            store.remove(id: item.id)
+        }
     }
 
     @discardableResult

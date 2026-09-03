@@ -1,28 +1,25 @@
 import AppKit
 
 // MARK: - 顶部拖拽条（视觉提示 + 拖动事件源）
+// 采用「锚点跟随」而非增量累加：每次拖动都按“按下时的偏移 + 鼠标当前位置”直接对齐窗口，
+// 快速拖动时即使事件被合并/丢帧，窗口也始终与鼠标 1:1 同步，不会越拖越滞后。
 
 final class DragHandleView: NSView {
-    var onDelta: ((NSPoint) -> Void)?
-    private var lastGlobal: CGPoint?
+    /// 按下瞬间（窗口将开始跟随鼠标）
+    var onGrab: (() -> Void)?
+    /// 拖动中：参数为当前全局鼠标位置
+    var onDragTo: ((CGPoint) -> Void)?
 
     override var mouseDownCanMoveWindow: Bool { false }
 
     override func mouseDown(with event: NSEvent) {
-        lastGlobal = NSEvent.mouseLocation
+        onGrab?()
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let last = lastGlobal else { return }
-        let cur = NSEvent.mouseLocation
-        let delta = CGPoint(x: cur.x - last.x, y: cur.y - last.y)
-        lastGlobal = cur
-        onDelta?(delta)
+        onDragTo?(NSEvent.mouseLocation)
     }
 
-    override func mouseUp(with event: NSEvent) {
-        lastGlobal = nil
-    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -49,24 +46,19 @@ final class DragHandleView: NSView {
 // MARK: - 右下角缩放手柄
 
 final class ResizeHandleView: NSView {
-    var onDelta: ((CGFloat, CGFloat) -> Void)?   // (dx, dy) 每次拖动的增量
-    private var lastGlobal: CGPoint?
+    /// 按下瞬间（记录起始几何）
+    var onGrab: (() -> Void)?
+    /// 拖动中：参数为当前全局鼠标位置
+    var onDragTo: ((CGPoint) -> Void)?
+
+    override var mouseDownCanMoveWindow: Bool { false }
 
     override func mouseDown(with event: NSEvent) {
-        lastGlobal = NSEvent.mouseLocation
+        onGrab?()
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let last = lastGlobal else { return }
-        let cur = NSEvent.mouseLocation
-        let dx = cur.x - last.x
-        let dy = cur.y - last.y
-        lastGlobal = cur
-        onDelta?(dx, dy)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        lastGlobal = nil
+        onDragTo?(NSEvent.mouseLocation)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -159,6 +151,12 @@ final class ItemEditorWindowController: NSObject {
     /// nil = 高度始终跟随文字自动伸缩
     private var pinnedTextHeight: CGFloat?
 
+    // 拖动/缩放的手势状态（锚点跟随法：按下记录基准，拖动按鼠标当前位置一次性对齐，保证不滞后）
+    private var dragGrabOffset = CGPoint.zero
+    private var resizeStartMouse = CGPoint.zero
+    private var resizeStartContent: CGRect = .zero
+    private var resizeStartPinned: CGFloat?
+
     init?(store: BoardStore, item: BoardItem) {
         guard item.kind == .text || item.kind == .image else { return nil }
         self.store = store
@@ -244,17 +242,32 @@ final class ItemEditorWindowController: NSObject {
         let click = NSClickGestureRecognizer(target: self, action: #selector(focusText))
         placeholder.addGestureRecognizer(click)
 
-        // 顶部拖动条 + 右下角缩放
-        handle.onDelta = { [weak self] delta in
+        // 顶部拖动条 + 右下角缩放（锚点跟随：按下记录偏移/起点，拖动按鼠标当前位置一次性对齐）
+        handle.onGrab = { [weak self] in
+            guard let self else { return }
+            let m = NSEvent.mouseLocation
+            self.dragGrabOffset = CGPoint(x: self.window.frame.origin.x - m.x,
+                                          y: self.window.frame.origin.y - m.y)
+        }
+        handle.onDragTo = { [weak self] mouse in
             guard let self else { return }
             var f = self.window.frame
-            f.origin.x += delta.x
-            f.origin.y += delta.y
-            self.window.setFrame(f, display: true)
-            self.syncContentFromCard()
+            f.origin = CGPoint(x: mouse.x + self.dragGrabOffset.x,
+                               y: mouse.y + self.dragGrabOffset.y)
+            // 只移动不改尺寸：几何写回交给 windowDidMove，拖动中不重排子视图
+            self.window.setFrame(f, display: false)
         }
-        resize.onDelta = { [weak self] dx, dy in
-            self?.applyResize(dx: dx, dy: dy)
+        resize.onGrab = { [weak self] in
+            guard let self else { return }
+            self.resizeStartMouse = NSEvent.mouseLocation
+            self.resizeStartContent = self.current.frame
+            self.resizeStartPinned = self.pinnedTextHeight
+        }
+        resize.onDragTo = { [weak self] mouse in
+            guard let self else { return }
+            let dx = mouse.x - self.resizeStartMouse.x
+            let dy = mouse.y - self.resizeStartMouse.y
+            self.applyResize(totalX: dx, totalY: dy)
         }
 
         // 格式条
@@ -478,50 +491,53 @@ final class ItemEditorWindowController: NSObject {
         layoutCard()
     }
 
-    /// 拖动/挪动窗口后，把窗口几何同步回模型
+    /// 拖动/挪动窗口后，把窗口几何同步回模型（仅移动时调用，不重排子视图）
     private func syncContentFromCard() {
         let content = BoardLayout.contentRect(forCard: window.frame, kind: kind)
         current.frame = content
         store.upsert(current)
-        layoutCard()
     }
 
-    private func applyResize(dx: CGFloat, dy: CGFloat) {
+    /// 缩放：以「按下瞬间」的几何为基准，按鼠标相对起点的总位移一次性计算目标几何，
+    /// 避免快速拖动时增量累加产生偏差/滞后。
+    private func applyResize(totalX: CGFloat, totalY: CGFloat) {
         guard kind == .text || kind == .image else { return }
         let minW: CGFloat = kind == .text ? 90 : 60
-        let top = current.frame.maxY
+        var content = resizeStartContent
+        let top = resizeStartContent.maxY   // 顶部锚定：缩放全程保持顶边不动
 
         if kind == .image {
-            var content = current.frame
             // 右下角手柄：屏幕坐标 y 向上，向下拖为负。取“位移主方向”作为宽度增量：
-            // 斜向拖 / 纯横向拖 → 用 dx；纯纵向拖（|dy|>|dx|）→ 用 -dy，向下 = 放大。
-            let dw: CGFloat = abs(dx) >= abs(dy) ? dx : -dy
+            // 斜向拖 / 纯横向拖 → 用 totalX；纯纵向拖（|dy|>|dx|）→ 用 -totalY，向下 = 放大。
+            let dw: CGFloat = abs(totalX) >= abs(totalY) ? totalX : -totalY
             content.size.width = max(minW, content.width + dw)
             content.size.height = content.width * currentImageAspect
-            content.origin.y = top - content.size.height   // 顶部锚定：放大时向下延展
+            content.origin.y = top - content.size.height   // 放大时向下延展
             current.frame = content
             store.upsert(current)
             applyWindowFrameFromContent()
             return
         }
 
-        // 文字：宽度随之变化并自动重排；纵向拖动可手动加高（不低于文字自然高度）
+        // 文字：宽度随之变化并自动重排；纵向拖动以起点高度为基准增减（不低于文字自然高度）
         current.text = textView.string
-        let width = max(minW, current.frame.width + dx)
+        let width = max(minW, content.width + totalX)
         let font = AppFonts.font(name: current.fontName, size: current.fontSize, bold: current.isBold)
         let autoH = TextLayout.height(text: current.text, font: font, width: width)
 
-        if abs(dy) >= 0.5 {
-            // 纵向拖动：屏幕坐标 y 向上，向下拖为负 → 取反后“向下 = 加高并向下延伸”。
-            // 直接设定高度，但不低于文字排版所需高度。
-            let h = max(autoH, current.frame.height - dy)
-            pinnedTextHeight = h > autoH + 0.5 ? h : nil
+        var targetH: CGFloat
+        if abs(totalY) >= 0.5 {
+            // 纵向拖动：屏幕坐标 y 向上，向下拖为负 → “向下 = 加高并向下延伸”
+            targetH = max(autoH, content.height - totalY)
+        } else if let p = resizeStartPinned, p > autoH + 0.5 {
+            targetH = max(autoH, p)   // 纯横向拖动：保留原有手动留白
+        } else {
+            targetH = autoH
         }
-        // 纯横向拖动：让 resolveTextHeight 决定（pin 保留 / auto 自动）
+        pinnedTextHeight = targetH > autoH + 0.5 ? targetH : nil
 
-        var content = current.frame
         content.size.width = width
-        content.size.height = resolveTextHeight(autoH: autoH)
+        content.size.height = max(autoH, targetH)
         content.origin.y = top - content.size.height
         current.frame = content
         store.upsert(current)
